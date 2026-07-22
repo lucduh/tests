@@ -1,0 +1,13 @@
+[project]
+name = "research"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "donut",
+    "pandas>=3.0.3",
+]
+
+[tool.uv.sources]
+donut = { path = "../donut" }
