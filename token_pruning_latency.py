@@ -1,4 +1,3 @@
-import math
 import time
 from pathlib import Path
 
@@ -9,6 +8,7 @@ from donut.model import decoder_start_ids, init_shift_tokens_from_decoder
 from transformers.modeling_outputs import BaseModelOutput
 
 IMAGE_SIZES = [(1280, 960), (1920, 1440), (2560, 1920)]  # (height, width)
+BATCH_SIZES = [1, 2, 4]
 KEEP_RATIOS = [1.0, 0.75, 0.5, 0.25, 0.1]
 MAX_NEW_TOKENS = 32
 N_WARMUP = 1
@@ -39,9 +39,18 @@ def timed_ms(fn, device, n_runs):
         synchronize(device)
         times.append((time.perf_counter() - start) * 1000)
 
-    mean = sum(times) / len(times)
-    std = math.sqrt(sum((value - mean) ** 2 for value in times) / len(times))
-    return result, mean, std
+    return result, sum(times) / len(times)
+
+
+def peak_memory_mb(fn, device):
+    if device.type != "cuda":
+        return None
+
+    synchronize(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    fn()
+    synchronize(device)
+    return torch.cuda.max_memory_allocated(device) / 1024**2
 
 
 def random_prune(
@@ -58,72 +67,70 @@ def benchmark_generation(donut: DonutModel) -> list[dict]:
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     init_shift_tokens_from_decoder(model)
-    start_ids = decoder_start_ids(model)
     records = []
 
     for height, width in IMAGE_SIZES:
-        pixels = torch.rand((1, 3, height, width), device=device, dtype=dtype)
-
-        def encode(pixel_values: torch.Tensor):
-            with torch.inference_mode():
-                return model.encoder(pixel_values, return_dict=True)
-
-        encode(pixels)  # warm-up
-        encoder_outputs, encoder_ms, encoder_std_ms = timed_ms(
-            lambda: encode(pixels), device, N_RUNS
-        )
-        hidden_states = encoder_outputs.last_hidden_state
-        n_tokens = hidden_states.shape[1]
-        generator = torch.Generator(device=device).manual_seed(SEED)
-        permutation = torch.randperm(n_tokens, generator=generator, device=device)
-        size_records = []
-        for keep_ratio in KEEP_RATIOS:
-            pruned_states = random_prune(hidden_states, keep_ratio, permutation)
-            pruned_outputs = BaseModelOutput(
-                last_hidden_state=pruned_states  # ty: ignore[invalid-argument-type]
+        for batch_size in BATCH_SIZES:
+            start_ids = decoder_start_ids(model, batch_size)
+            pixels = torch.rand(
+                (batch_size, 3, height, width), device=device, dtype=dtype
             )
 
-            def generate():
+            def encode():
                 with torch.inference_mode():
-                    return model.generate(  # ty: ignore[invalid-argument-type, missing-argument]
-                        encoder_outputs=pruned_outputs,
-                        decoder_input_ids=start_ids,
-                        max_new_tokens=MAX_NEW_TOKENS,
-                        min_new_tokens=MAX_NEW_TOKENS,
-                        do_sample=False,
-                        use_cache=True,
-                    )
+                    return model.encoder(pixels, return_dict=True)
 
-            for _ in range(N_WARMUP):
-                generate()
-            _, generation_ms, generation_std_ms = timed_ms(generate, device, N_RUNS)
-            size_records.append(
-                {
-                    "image_height": height,
-                    "image_width": width,
-                    "keep_ratio": keep_ratio,
-                    "prune_ratio": 1.0 - keep_ratio,
-                    "visual_tokens": pruned_states.shape[1],
-                    "encoder_ms": encoder_ms,
-                    "encoder_std_ms": encoder_std_ms,
-                    "generation_ms": generation_ms,
-                    "generation_std_ms": generation_std_ms,
-                }
-            )
+            encode()
+            encoder_outputs, encoder_ms = timed_ms(encode, device, N_RUNS)
+            hidden_states = encoder_outputs.last_hidden_state
+            n_tokens = hidden_states.shape[1]
+            generator = torch.Generator(device=device).manual_seed(SEED)
+            permutation = torch.randperm(n_tokens, generator=generator, device=device)
 
-        baseline_ms = size_records[0]["generation_ms"]
-        for record in size_records:
-            record["generation_speedup"] = baseline_ms / record["generation_ms"]
-            # The encoder is not pruned in this experiment.
-            record["estimated_end_to_end_ms"] = encoder_ms + record["generation_ms"]
-            record["estimated_end_to_end_speedup"] = (
-                encoder_ms + baseline_ms
-            ) / record["estimated_end_to_end_ms"]
-        records.extend(size_records)
+            for keep_ratio in KEEP_RATIOS:
+                pruned_states = random_prune(hidden_states, keep_ratio, permutation)
+                pruned_outputs = BaseModelOutput(
+                    last_hidden_state=pruned_states  # ty: ignore[invalid-argument-type]
+                )
 
-        pixels = torch.empty(0, device=device, dtype=dtype)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+                def generate(n_tokens):
+                    with torch.inference_mode():
+                        return model.generate(  # ty: ignore[invalid-argument-type, missing-argument]
+                            encoder_outputs=pruned_outputs,
+                            decoder_input_ids=start_ids,
+                            max_new_tokens=n_tokens,
+                            min_new_tokens=n_tokens,
+                            do_sample=False,
+                            use_cache=True,
+                        )
+
+                for _ in range(N_WARMUP):
+                    generate(1)
+                    generate(MAX_NEW_TOKENS)
+
+                _, first_token_ms = timed_ms(lambda: generate(1), device, N_RUNS)
+                _, generation_ms = timed_ms(
+                    lambda: generate(MAX_NEW_TOKENS), device, N_RUNS
+                )
+                peak_mb = peak_memory_mb(lambda: generate(MAX_NEW_TOKENS), device)
+
+                records.append(
+                    {
+                        "image_height": height,
+                        "image_width": width,
+                        "batch_size": batch_size,
+                        "keep_ratio": keep_ratio,
+                        "visual_tokens": pruned_states.shape[1],
+                        "encoder_ms": encoder_ms,
+                        "first_token_decoder_ms": first_token_ms,
+                        "generation_ms": generation_ms,
+                        "peak_memory_mb": peak_mb,
+                    }
+                )
+
+            pixels = torch.empty(0, device=device, dtype=dtype)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     return records
 
