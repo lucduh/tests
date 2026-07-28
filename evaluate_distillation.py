@@ -67,11 +67,10 @@ def evaluate(checkpoint, samples, device, max_new_tokens):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("teacher_checkpoint")
-    parser.add_argument("student_checkpoint")
+    parser.add_argument("checkpoint")
     parser.add_argument("data_json", type=Path)
     parser.add_argument(
-        "--output", type=Path, default=Path("results/distillation_evaluation.json")
+        "--output", type=Path, default=Path("results/model_evaluation.json")
     )
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument(
@@ -80,16 +79,13 @@ def main():
     args = parser.parse_args()
 
     samples = load_samples(args.data_json)
+    result = evaluate(args.checkpoint, samples, args.device, args.max_new_tokens)
     record = {
         "metric": "strict_macro_field_f1",
+        "checkpoint": args.checkpoint,
         "data_json": str(args.data_json),
         "documents": len(samples),
-        "teacher": evaluate(
-            args.teacher_checkpoint, samples, args.device, args.max_new_tokens
-        ),
-        "student": evaluate(
-            args.student_checkpoint, samples, args.device, args.max_new_tokens
-        ),
+        **result,
     }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
