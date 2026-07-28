@@ -1,5 +1,4 @@
 import argparse
-import json
 import random
 from collections import Counter
 from dataclasses import asdict, dataclass
@@ -7,15 +6,12 @@ from pathlib import Path
 
 import torch
 from donut import DonutModel
-from donut.constants import (
-    DATA_DIR,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_MAX_LENGTH,
-    TRAIN_RUNS_DIR,
-)
+from donut.constants import DATA_DIR, DEFAULT_IMAGE_SIZE, DEFAULT_MAX_LENGTH
 from donut.dataset import DonutDataset, load_samples
 from donut.model import autocast
+from donut.runio import run_meta, save_record
 from encoder_student import EncoderStudentConfig, create_encoder_student
+from research_paths import RESEARCH_RUNS_DIR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import get_linear_schedule_with_warmup
@@ -47,7 +43,7 @@ class Config:
     stage_depth: int = 8
     kept_blocks: tuple[int, ...] | None = None
     run_name: str = "swin-distillation"
-    output_dir: Path = TRAIN_RUNS_DIR
+    output_dir: Path = RESEARCH_RUNS_DIR
 
 
 def seed_everything(seed):
@@ -252,10 +248,15 @@ def train(config):
             student_donut.save_checkpoint(run_dir / "best")
 
     student_donut.save_checkpoint(run_dir / "last")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "train.json").write_text(
-        json.dumps({"config": asdict(config), "epochs": history}, indent=2, default=str)
-        + "\n"
+    save_record(
+        run_dir,
+        "train.json",
+        {
+            "meta": run_meta(config.device, None, str(config.teacher_path)),
+            "config": asdict(config),
+            "best_val_loss": best_val_loss,
+            "epochs": history,
+        },
     )
 
 
@@ -267,7 +268,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("teacher_path", type=Path)
     parser.add_argument("--data-json", type=Path, default=DATA_DIR / "train.json")
-    parser.add_argument("--output-dir", type=Path, default=TRAIN_RUNS_DIR)
+    parser.add_argument("--output-dir", type=Path, default=RESEARCH_RUNS_DIR)
     parser.add_argument("--run-name", default="swin-distillation")
     parser.add_argument("--stage-index", type=int, default=2)
     parser.add_argument("--stage-depth", type=int, default=8)

@@ -1,5 +1,4 @@
 import argparse
-import json
 from pathlib import Path
 
 import torch
@@ -7,7 +6,9 @@ from donut import DonutModel
 from donut.constants import DEFAULT_MAX_NEW_TOKENS
 from donut.dataset import load_samples, parse_prediction
 from donut.metrics import field_stats
+from donut.runio import run_meta, save_record
 from PIL import Image
+from research_paths import EVALUATION_DIR
 from tqdm import tqdm
 
 
@@ -65,13 +66,17 @@ def evaluate(checkpoint, samples, device, max_new_tokens):
     }
 
 
+def default_model_name(checkpoint):
+    path = Path(checkpoint)
+    return path.parent.name if path.name in {"best", "last"} else path.name
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint")
     parser.add_argument("data_json", type=Path)
-    parser.add_argument(
-        "--output", type=Path, default=Path("results/model_evaluation.json")
-    )
+    parser.add_argument("--out", type=Path, default=EVALUATION_DIR)
+    parser.add_argument("--name")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
@@ -80,16 +85,22 @@ def main():
 
     samples = load_samples(args.data_json)
     result = evaluate(args.checkpoint, samples, args.device, args.max_new_tokens)
+    name = args.name or default_model_name(args.checkpoint)
     record = {
-        "metric": "strict_macro_field_f1",
-        "checkpoint": args.checkpoint,
-        "data_json": str(args.data_json),
-        "documents": len(samples),
-        **result,
+        "meta": run_meta(args.device, None, args.checkpoint),
+        "config": {
+            "name": name,
+            "checkpoint": args.checkpoint,
+            "data_json": args.data_json,
+            "documents": len(samples),
+            "max_new_tokens": args.max_new_tokens,
+        },
+        "summary": {
+            "strict_macro_field_f1": result["score"],
+            "parameters": result["parameters"],
+        },
     }
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(record, indent=2) + "\n")
+    save_record(args.out, f"{name}.json", record)
 
 
 if __name__ == "__main__":
